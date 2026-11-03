@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 from urllib.parse import urlparse, urlencode
@@ -5,13 +6,13 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import json
 
+APP_VERSION = "1.4.0"
 
 app = FastAPI(
     title="Redetube Server",
     description="Backend API for Redetube",
-    version="1.4.0"
+    version=APP_VERSION
 )
-
 
 PLATFORMS = {
     "YouTube": ["youtube.com", "youtu.be"],
@@ -21,13 +22,11 @@ PLATFORMS = {
     "X": ["x.com", "twitter.com"]
 }
 
-
 OEMBED_ENDPOINTS = {
     "YouTube": "https://www.youtube.com/oembed",
     "TikTok": "https://www.tiktok.com/oembed",
     "X": "https://publish.twitter.com/oembed"
 }
-
 
 REQUEST_TIMEOUT = 12
 MAX_RESPONSE_SIZE = 1_000_000
@@ -37,26 +36,18 @@ class AnalyzeRequest(BaseModel):
     url: HttpUrl
 
 
-def is_direct_mp4(url: str) -> bool:
-    """
-    Detect a URL whose path ends in .mp4.
-    This identifies a direct MP4 candidate; it does not
-    guarantee that the remote server allows downloading it.
-    """
-    try:
-        parsed = urlparse(url)
+def is_direct_mp4(url: str):
+    parsed = urlparse(url)
 
-        return (
-            parsed.scheme == "https"
-            and bool(parsed.hostname)
-            and parsed.path.lower().endswith(".mp4")
-        )
-    except Exception:
-        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.path.lower().endswith(".mp4")
+        and bool(parsed.hostname)
+    )
 
 
 def detect_platform(url: str):
-    parsed = urlparse(url)
+    parsed = urlparse(str(url))
     host = (parsed.hostname or "").lower()
 
     if not host or parsed.scheme not in ("http", "https"):
@@ -162,7 +153,7 @@ def home():
     return {
         "app": "Redetube",
         "status": "online",
-        "version": "1.4.0",
+        "version": APP_VERSION,
         "message": "Redetube server is running"
     }
 
@@ -172,49 +163,42 @@ def health():
     return {
         "status": "ok",
         "service": "Redetube Server",
-        "version": "1.4.0"
+        "version": APP_VERSION
     }
 
 
 @app.post("/analyze")
 def analyze_link(request: AnalyzeRequest):
-
     url = str(request.url)
 
-    # 1. Detect direct MP4 links first.
+    # Direct MP4 links
     if is_direct_mp4(url):
         return {
             "status": "success",
             "platform": "Direct MP4",
             "url": url,
             "metadata_available": False,
-            "title": None,
+            "title": "Direct MP4 video",
             "author": None,
             "thumbnail_url": None,
-            "provider": "Direct video link",
+            "provider": "Direct MP4",
             "download_available": True,
             "download_url": url,
             "download_type": "direct_mp4",
-            "message": (
-                "Direct MP4 link detected. "
-                "The remote server must permit access and downloading."
-            )
+            "message": "Direct MP4 link detected."
         }
 
-    # 2. Detect supported social platforms.
     platform = detect_platform(url)
 
     if not platform:
         raise HTTPException(
             status_code=400,
             detail=(
-                "Unsupported link. Supported platforms: "
-                "YouTube, Instagram, Facebook, TikTok and X. "
-                "Direct HTTPS MP4 links are also supported."
+                "Unsupported platform. Supported: "
+                "YouTube, Instagram, Facebook, TikTok and X."
             )
         )
 
-    # 3. Retrieve public metadata through oEmbed.
     metadata = fetch_oembed(platform, url)
 
     if metadata:
@@ -233,7 +217,6 @@ def analyze_link(request: AnalyzeRequest):
             "message": "Video information retrieved successfully."
         }
 
-    # 4. Platform recognized, but metadata unavailable.
     if platform in ("Instagram", "Facebook"):
         message = (
             "Platform recognized. Official API access may be "
