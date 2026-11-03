@@ -9,7 +9,7 @@ import json
 app = FastAPI(
     title="Redetube Server",
     description="Backend API for Redetube",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 PLATFORMS = {
@@ -63,7 +63,7 @@ def fetch_oembed(platform: str, video_url: str):
     request = Request(
         f"{endpoint}?{query}",
         headers={
-            "User-Agent": "Redetube/1.2 (Android; compatible)",
+            "User-Agent": "Mozilla/5.0 (compatible; Redetube/1.3)",
             "Accept": "application/json"
         },
         method="GET"
@@ -71,6 +71,7 @@ def fetch_oembed(platform: str, video_url: str):
 
     try:
         with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+
             if response.status != 200:
                 return None
 
@@ -81,27 +82,60 @@ def fetch_oembed(platform: str, video_url: str):
 
             data = json.loads(content.decode("utf-8"))
 
-            thumbnail = data.get("thumbnail_url")
-            thumbnail_host = (
-                urlparse(thumbnail).hostname or ""
-            ).lower() if thumbnail else ""
+            if not isinstance(data, dict):
+                return None
 
-            # Only return secure thumbnail URLs.
-            if thumbnail and not (
-                urlparse(thumbnail).scheme == "https"
-                and thumbnail_host
-            ):
+            title = data.get("title")
+            author = data.get("author_name")
+            thumbnail = data.get("thumbnail_url")
+            provider = data.get("provider_name")
+
+            # Clean and validate text fields.
+            title = title.strip() if isinstance(title, str) else None
+            author = author.strip() if isinstance(author, str) else None
+            provider = provider.strip() if isinstance(provider, str) else None
+
+            if not title:
+                title = None
+
+            if not author:
+                author = None
+
+            if not provider:
+                provider = None
+
+            # Validate thumbnail URL.
+            if isinstance(thumbnail, str):
+                parsed_thumbnail = urlparse(thumbnail)
+
+                if (
+                    parsed_thumbnail.scheme != "https"
+                    or not parsed_thumbnail.hostname
+                ):
+                    thumbnail = None
+            else:
                 thumbnail = None
 
+            # Do not report success if all useful metadata is missing.
+            if not any([title, author, thumbnail]):
+                return None
+
             return {
-                "title": data.get("title"),
-                "author": data.get("author_name"),
+                "title": title,
+                "author": author,
                 "thumbnail_url": thumbnail,
-                "provider": data.get("provider_name"),
+                "provider": provider or platform,
                 "metadata_available": True
             }
 
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        UnicodeDecodeError
+    ):
         return None
 
 
@@ -110,7 +144,7 @@ def home():
     return {
         "app": "Redetube",
         "status": "online",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "message": "Redetube server is running"
     }
 
@@ -120,7 +154,7 @@ def health():
     return {
         "status": "ok",
         "service": "Redetube Server",
-        "version": "1.2.0"
+        "version": "1.3.0"
     }
 
 
@@ -146,10 +180,10 @@ def analyze_link(request: AnalyzeRequest):
             "platform": platform,
             "url": url,
             "metadata_available": True,
-            "title": metadata.get("title"),
-            "author": metadata.get("author"),
-            "thumbnail_url": metadata.get("thumbnail_url"),
-            "provider": metadata.get("provider"),
+            "title": metadata["title"],
+            "author": metadata["author"],
+            "thumbnail_url": metadata["thumbnail_url"],
+            "provider": metadata["provider"],
             "message": "Video information retrieved successfully."
         }
 
@@ -160,7 +194,7 @@ def analyze_link(request: AnalyzeRequest):
         )
     else:
         message = (
-            "Platform recognized, but public video information "
+            "Platform recognized, but useful video metadata "
             "could not be retrieved. The content may be private, "
             "unavailable, or unsupported by the provider."
         )
