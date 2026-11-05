@@ -1,4 +1,6 @@
+
 import logging
+import os
 from urllib.parse import urlencode, urlparse
 
 import yt_dlp
@@ -8,16 +10,26 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, HttpUrl
 
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "https://redetube-server.onrender.com"
+).rstrip("/")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
 logger = logging.getLogger("redetube")
+
 
 app = FastAPI(
     title="Redetube Server",
     description="Video analysis and download API",
     version=APP_VERSION,
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 PLATFORMS = {
     "youtube": ["youtube.com", "youtu.be"],
     "instagram": ["instagram.com"],
@@ -34,6 +47,7 @@ PLATFORMS = {
     "tiktok": ["tiktok.com"],
     "x": ["x.com", "twitter.com"],
 }
+
 
 PLATFORM_NAMES = {
     "youtube": "YouTube",
@@ -48,8 +62,27 @@ class AnalyzeRequest(BaseModel):
     url: HttpUrl
 
 
+class YtDlpLogger:
+    def debug(self, message):
+        logger.info("yt-dlp: %s", message)
+
+    def warning(self, message):
+        logger.warning("yt-dlp: %s", message)
+
+    def error(self, message):
+        logger.error("yt-dlp: %s", message)
+
+
 def detect_platform(url: str):
-    host = (urlparse(url).hostname or "").lower()
+    parsed = urlparse(url)
+
+    if parsed.scheme.lower() != "https":
+        return None
+
+    if parsed.username or parsed.password:
+        return None
+
+    host = (parsed.hostname or "").lower()
 
     for platform, domains in PLATFORMS.items():
         for domain in domains:
@@ -59,11 +92,25 @@ def detect_platform(url: str):
     return None
 
 
+def validate_platform_url(url: str):
+    platform = detect_platform(url)
+
+    if not platform:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported or invalid video URL. HTTPS is required.",
+        )
+
+    return platform
+
+
 def is_direct_mp4(url: str):
     parsed = urlparse(url)
 
     return (
-        parsed.scheme == "https"
+        parsed.scheme.lower() == "https"
+        and not parsed.username
+        and not parsed.password
         and parsed.path.lower().endswith(".mp4")
     )
 
@@ -71,17 +118,32 @@ def is_direct_mp4(url: str):
 def extract_video_info(url: str):
     options = {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "noplaylist": True,
         "skip_download": True,
-        "socket_timeout": 20,
-        "retries": 1,
-        "extractor_retries": 1,
+        "socket_timeout": 30,
+        "retries": 2,
+        "extractor_retries": 2,
+        "fragment_retries": 2,
         "cachedir": False,
+        "logger": YtDlpLogger(),
     }
 
+    logger.info(
+        "Starting yt-dlp extraction. Host: %s",
+        urlparse(url).hostname,
+    )
+
     with yt_dlp.YoutubeDL(options) as downloader:
-        return downloader.extract_info(url, download=False)
+        info = downloader.extract_info(
+            url,
+            download=False,
+        )
+
+    if not info:
+        raise ValueError("yt-dlp returned empty video information")
+
+    return info
 
 
 def has_audio_and_video(item: dict):
@@ -89,29 +151,44 @@ def has_audio_and_video(item: dict):
     audio_codec = item.get("acodec")
 
     return (
-        video_codec
+        bool(video_codec)
         and video_codec != "none"
-        and audio_codec
+        and bool(audio_codec)
         and audio_codec != "none"
-        and item.get("url")
+        and bool(item.get("url"))
     )
 
 
-def make_format_list(info: dict, request: Request):
+def make_format_list(info: dict):
     formats = info.get("formats") or []
     available = []
+
+    source_url = (
+        info.get("webpage_url")
+        or info.get("original_url")
+        or ""
+    )
+
+    if not source_url:
+        logger.warning("Video information has no webpage URL")
 
     for item in formats:
         if not has_audio_and_video(item):
             continue
 
         format_id = item.get("format_id")
+
         if not format_id:
+            continue
+
+        protocol = item.get("protocol") or ""
+
+        if protocol not in ("http", "https"):
             continue
 
         height = item.get("height")
         width = item.get("width")
-        ext = item.get("ext") or "mp4"
+        ext = item.get("ext") or "unknown"
 
         if height:
             resolution = f"{height}p"
@@ -126,12 +203,13 @@ def make_format_list(info: dict, request: Request):
         )
 
         download_query = urlencode({
-            "url": info.get("webpage_url") or info.get("original_url"),
-            "format_id": format_id,
+            "url": source_url,
+            "format_id": str(format_id),
         })
 
-        base_url = str(request.base_url).rstrip("/")
-        download_url = f"{base_url}/download?{download_query}"
+        download_url = (
+            f"{PUBLIC_BASE_URL}/download?{download_query}"
+        )
 
         available.append({
             "format_id": str(format_id),
@@ -168,6 +246,7 @@ def health():
         "status": "ok",
         "service": "Redetube Server",
         "version": APP_VERSION,
+        "yt_dlp_version": yt_dlp.version.__version__,
     }
 
 
@@ -191,23 +270,15 @@ def analyze(data: AnalyzeRequest, request: Request):
             "message": "Direct MP4 video is ready to download.",
         }
 
-    platform = detect_platform(url)
-
-    if not platform:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported video platform.",
-        )
+    platform = validate_platform_url(url)
 
     try:
         info = extract_video_info(url)
 
-        if not info:
-            raise ValueError("No video information returned")
-
-        formats = make_format_list(info, request)
+        formats = make_format_list(info)
 
         title = info.get("title")
+
         author = (
             info.get("uploader")
             or info.get("channel")
@@ -215,6 +286,13 @@ def analyze(data: AnalyzeRequest, request: Request):
         )
 
         thumbnail = info.get("thumbnail")
+
+        logger.info(
+            "Extraction successful. Platform: %s, title available: %s, formats: %s",
+            platform,
+            bool(title),
+            len(formats),
+        )
 
         return {
             "status": "success",
@@ -240,9 +318,10 @@ def analyze(data: AnalyzeRequest, request: Request):
         }
 
     except Exception as error:
-        logger.warning(
-            "Analysis failed for %s: %s",
+        logger.exception(
+            "Analysis failed. Platform: %s, host: %s, error: %s",
             platform,
+            urlparse(url).hostname,
             error,
         )
 
@@ -258,29 +337,24 @@ def analyze(data: AnalyzeRequest, request: Request):
             "download_type": None,
             "download_url": None,
             "formats": [],
+            "error_code": "extraction_failed",
             "message": (
-                "The platform was recognized, but its video could not "
-                "be accessed. The post may be private, restricted, "
-                "or temporarily unavailable."
+                "The platform was recognized, but video extraction "
+                "failed. Check the server logs for details."
             ),
         }
 
 
 @app.get("/download")
 def download(
-    url: str = Query(...),
+    url: HttpUrl = Query(...),
     format_id: str = Query(...),
 ):
-    platform = detect_platform(url)
-
-    if not platform:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported video platform.",
-        )
+    video_url = str(url)
+    platform = validate_platform_url(video_url)
 
     try:
-        info = extract_video_info(url)
+        info = extract_video_info(video_url)
 
         formats = info.get("formats") or []
 
@@ -289,6 +363,7 @@ def download(
                 item for item in formats
                 if str(item.get("format_id")) == format_id
                 and has_audio_and_video(item)
+                and item.get("protocol") in ("http", "https")
             ),
             None,
         )
@@ -307,21 +382,30 @@ def download(
                 detail="Media URL is unavailable.",
             )
 
+        logger.info(
+            "Redirecting download. Platform: %s, format: %s",
+            platform,
+            format_id,
+        )
+
         return RedirectResponse(
             url=media_url,
             status_code=302,
+            headers={"Cache-Control": "no-store"},
         )
 
     except HTTPException:
         raise
 
     except Exception as error:
-        logger.warning("Download failed: %s", error)
+        logger.exception(
+            "Download failed. Platform: %s, host: %s, error: %s",
+            platform,
+            urlparse(video_url).hostname,
+            error,
+        )
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                "The platform could not provide this video. "
-                "Please try again later."
-            ),
+            detail="The platform could not provide this video. Please try again later.",
         )
