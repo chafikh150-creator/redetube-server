@@ -1,57 +1,47 @@
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
-from urllib.parse import urlparse, urlencode
+import re
+import logging
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-import json
 
-APP_VERSION = "1.4.0"
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+
+APP_VERSION = "2.0.0"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("redetube")
 
 app = FastAPI(
     title="Redetube Server",
-    description="Backend API for Redetube",
+    description="Video analysis API for Redetube",
     version=APP_VERSION
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 PLATFORMS = {
-    "YouTube": ["youtube.com", "youtu.be"],
-    "Instagram": ["instagram.com"],
-    "Facebook": ["facebook.com", "fb.watch"],
-    "TikTok": ["tiktok.com"],
-    "X": ["x.com", "twitter.com"]
+    "youtube": ["youtube.com", "youtu.be"],
+    "instagram": ["instagram.com"],
+    "facebook": ["facebook.com", "fb.watch"],
+    "tiktok": ["tiktok.com"],
+    "x": ["x.com", "twitter.com"],
 }
-
-OEMBED_ENDPOINTS = {
-    "YouTube": "https://www.youtube.com/oembed",
-    "TikTok": "https://www.tiktok.com/oembed",
-    "X": "https://publish.twitter.com/oembed"
-}
-
-REQUEST_TIMEOUT = 12
-MAX_RESPONSE_SIZE = 1_000_000
 
 
 class AnalyzeRequest(BaseModel):
     url: HttpUrl
 
 
-def is_direct_mp4(url: str):
-    parsed = urlparse(url)
-
-    return (
-        parsed.scheme == "https"
-        and parsed.path.lower().endswith(".mp4")
-        and bool(parsed.hostname)
-    )
-
-
 def detect_platform(url: str):
-    parsed = urlparse(str(url))
-    host = (parsed.hostname or "").lower()
-
-    if not host or parsed.scheme not in ("http", "https"):
-        return None
+    host = (urlparse(url).hostname or "").lower()
 
     for platform, domains in PLATFORMS.items():
         for domain in domains:
@@ -61,100 +51,76 @@ def detect_platform(url: str):
     return None
 
 
-def fetch_oembed(platform: str, video_url: str):
-    endpoint = OEMBED_ENDPOINTS.get(platform)
+def is_direct_mp4(url: str):
+    parsed = urlparse(url)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.path.lower().endswith(".mp4")
+    )
+
+
+def fetch_oembed(endpoint: str):
+    try:
+        request = Request(
+            endpoint,
+            headers={
+                "User-Agent": "Mozilla/5.0 Redetube/2.0"
+            }
+        )
+
+        with urlopen(request, timeout=12) as response:
+            content = response.read(1024 * 1024)
+
+        import json
+        data = json.loads(content.decode("utf-8"))
+
+        return {
+            "title": data.get("title"),
+            "author": data.get("author_name"),
+            "thumbnail_url": data.get("thumbnail_url"),
+            "provider": data.get("provider_name"),
+        }
+
+    except Exception as error:
+        logger.warning("Metadata unavailable: %s", error)
+        return None
+
+
+def get_metadata(url: str, platform: str):
+    import urllib.parse
+
+    encoded_url = urllib.parse.quote(url, safe="")
+
+    endpoints = {
+        "youtube": (
+            "https://www.youtube.com/oembed"
+            f"?url={encoded_url}&format=json"
+        ),
+        "tiktok": (
+            "https://www.tiktok.com/oembed?url="
+            f"{encoded_url}"
+        ),
+        "x": (
+            "https://publish.twitter.com/oembed?url="
+            f"{encoded_url}"
+        ),
+    }
+
+    endpoint = endpoints.get(platform)
 
     if not endpoint:
         return None
 
-    query = urlencode({
-        "url": video_url,
-        "format": "json"
-    })
-
-    request = Request(
-        f"{endpoint}?{query}",
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; Redetube/1.4)",
-            "Accept": "application/json"
-        },
-        method="GET"
-    )
-
-    try:
-        with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-
-            if response.status != 200:
-                return None
-
-            content = response.read(MAX_RESPONSE_SIZE + 1)
-
-            if len(content) > MAX_RESPONSE_SIZE:
-                return None
-
-            data = json.loads(content.decode("utf-8"))
-
-            if not isinstance(data, dict):
-                return None
-
-            title = data.get("title")
-            author = data.get("author_name")
-            thumbnail = data.get("thumbnail_url")
-            provider = data.get("provider_name")
-
-            title = title.strip() if isinstance(title, str) else None
-            author = author.strip() if isinstance(author, str) else None
-            provider = provider.strip() if isinstance(provider, str) else None
-
-            if not title:
-                title = None
-
-            if not author:
-                author = None
-
-            if not provider:
-                provider = None
-
-            if isinstance(thumbnail, str):
-                parsed_thumbnail = urlparse(thumbnail)
-
-                if (
-                    parsed_thumbnail.scheme != "https"
-                    or not parsed_thumbnail.hostname
-                ):
-                    thumbnail = None
-            else:
-                thumbnail = None
-
-            if not any([title, author, thumbnail]):
-                return None
-
-            return {
-                "title": title,
-                "author": author,
-                "thumbnail_url": thumbnail,
-                "provider": provider or platform,
-                "metadata_available": True
-            }
-
-    except (
-        HTTPError,
-        URLError,
-        TimeoutError,
-        OSError,
-        ValueError,
-        UnicodeDecodeError
-    ):
-        return None
+    return fetch_oembed(endpoint)
 
 
 @app.get("/")
-def home():
+def root():
     return {
-        "app": "Redetube",
-        "status": "online",
+        "name": "Redetube Server",
         "version": APP_VERSION,
-        "message": "Redetube server is running"
+        "status": "online"
     }
 
 
@@ -168,24 +134,22 @@ def health():
 
 
 @app.post("/analyze")
-def analyze_link(request: AnalyzeRequest):
+def analyze(request: AnalyzeRequest):
     url = str(request.url)
 
-    # Direct MP4 links
     if is_direct_mp4(url):
         return {
             "status": "success",
             "platform": "Direct MP4",
             "url": url,
-            "metadata_available": False,
-            "title": "Direct MP4 video",
+            "title": "Direct video",
             "author": None,
             "thumbnail_url": None,
-            "provider": "Direct MP4",
+            "metadata_available": False,
             "download_available": True,
-            "download_url": url,
             "download_type": "direct_mp4",
-            "message": "Direct MP4 link detected."
+            "download_url": url,
+            "message": "Direct MP4 video is ready to download."
         }
 
     platform = detect_platform(url)
@@ -193,53 +157,51 @@ def analyze_link(request: AnalyzeRequest):
     if not platform:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Unsupported platform. Supported: "
-                "YouTube, Instagram, Facebook, TikTok and X."
-            )
+            detail="Unsupported video platform."
         )
 
-    metadata = fetch_oembed(platform, url)
+    metadata = get_metadata(url, platform)
+
+    platform_names = {
+        "youtube": "YouTube",
+        "instagram": "Instagram",
+        "facebook": "Facebook",
+        "tiktok": "TikTok",
+        "x": "X"
+    }
 
     if metadata:
         return {
             "status": "success",
-            "platform": platform,
+            "platform": platform_names[platform],
             "url": url,
+            "title": metadata.get("title"),
+            "author": metadata.get("author"),
+            "thumbnail_url": metadata.get("thumbnail_url"),
+            "provider": metadata.get("provider"),
             "metadata_available": True,
-            "title": metadata["title"],
-            "author": metadata["author"],
-            "thumbnail_url": metadata["thumbnail_url"],
-            "provider": metadata["provider"],
             "download_available": False,
-            "download_url": None,
             "download_type": None,
-            "message": "Video information retrieved successfully."
+            "download_url": None,
+            "message": (
+                "Video information retrieved successfully. "
+                "Direct download is not available for this link."
+            )
         }
-
-    if platform in ("Instagram", "Facebook"):
-        message = (
-            "Platform recognized. Official API access may be "
-            "required to retrieve video information."
-        )
-    else:
-        message = (
-            "Platform recognized, but useful video metadata "
-            "could not be retrieved. The content may be private, "
-            "unavailable, or unsupported by the provider."
-        )
 
     return {
         "status": "recognized",
-        "platform": platform,
+        "platform": platform_names[platform],
         "url": url,
-        "metadata_available": False,
         "title": None,
         "author": None,
         "thumbnail_url": None,
-        "provider": platform,
+        "metadata_available": False,
         "download_available": False,
-        "download_url": None,
         "download_type": None,
-        "message": message
+        "download_url": None,
+        "message": (
+            "Platform recognized, but video information "
+            "could not be retrieved."
+        )
     }
