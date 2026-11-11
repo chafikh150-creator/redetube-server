@@ -1,6 +1,10 @@
 
+import ipaddress
 import logging
 import os
+import re
+import time
+from collections import defaultdict, deque
 from urllib.parse import urlencode, urlparse
 
 import yt_dlp
@@ -28,12 +32,40 @@ app = FastAPI(
     title="Redetube Server",
     description="Video analysis and download API",
     version=APP_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
+
+MAX_URL_LENGTH = 2048
+RATE_LIMIT_REQUESTS = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
+_request_log = defaultdict(deque)
+
+
+@app.middleware("http")
+async def limit_requests(request: Request, call_next):
+    """Very small in-memory rate limit per client address (protects against abuse)."""
+    if request.url.path in ("/analyze", "/download"):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        client = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+        now = time.time()
+        bucket = _request_log[client]
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_REQUESTS:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=429, content={"detail": "Too many requests. Please wait a minute."})
+        bucket.append(now)
+        if len(_request_log) > 5000:
+            for key in list(_request_log.keys())[:1000]:
+                _request_log.pop(key, None)
+    return await call_next(request)
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[],  # the Android app does not need browser CORS access
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
@@ -104,8 +136,22 @@ def validate_platform_url(url: str):
     return platform
 
 
+def is_public_host(host: str) -> bool:
+    host = (host or "").lower()
+    if not host or host == "localhost" or host.endswith((".local", ".internal", ".localdomain", ".lan", ".home")):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+        return not (address.is_private or address.is_loopback or address.is_link_local
+                    or address.is_reserved or address.is_multicast or address.is_unspecified)
+    except ValueError:
+        return True
+
+
 def is_direct_mp4(url: str):
     parsed = urlparse(url)
+    if not is_public_host(parsed.hostname):
+        return False
 
     return (
         parsed.scheme.lower() == "https"
@@ -253,6 +299,8 @@ def health():
 @app.post("/analyze")
 def analyze(data: AnalyzeRequest, request: Request):
     url = str(data.url)
+    if len(url) > MAX_URL_LENGTH:
+        raise HTTPException(status_code=400, detail="URL too long.")
 
     if is_direct_mp4(url):
         return {
@@ -348,9 +396,11 @@ def analyze(data: AnalyzeRequest, request: Request):
 @app.get("/download")
 def download(
     url: HttpUrl = Query(...),
-    format_id: str = Query(...),
+    format_id: str = Query(..., max_length=40),
 ):
     video_url = str(url)
+    if len(video_url) > MAX_URL_LENGTH or not re.fullmatch(r"[A-Za-z0-9_.\-]{1,40}", format_id):
+        raise HTTPException(status_code=400, detail="Invalid request.")
     platform = validate_platform_url(video_url)
 
     try:
